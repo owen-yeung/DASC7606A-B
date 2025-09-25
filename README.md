@@ -127,7 +127,7 @@ DASC7606A-B/
   - **Model**: Design a more effective CNN (Even the SOTA architectures!) in `scripts/model_architectures.py` suitable for 100 classes.
   - **Hyperparameters**: Tune training hyperparameters passed to `main.py` (e.g., learning rate, weight decay, batch size, scheduler, epochs).
 - **Scope of changes (must follow)**:
-  - Modify only: `scripts/data_augmentation.py`, `scripts/model_architectures.py`, and the hyperparameter arguments you feed into `main.py`.
+  - Modify only: `scripts/data_augmentation.py`, `scripts/model_architectures.py`, `scripts/train_utils.py`, and the hyperparameter arguments you feed into `main.py`.
   - Do not change the notebooks; use them to visualize, experiment, and understand the pipeline.
 - **How to run CIFAR-100 training (example)**:
   ```bash
