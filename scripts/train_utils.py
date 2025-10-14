@@ -1,10 +1,12 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-import os
+
 
 def load_transforms():
     """
@@ -31,16 +33,11 @@ def load_data(data_dir, batch_size):
     # Define data transformations: resize, convert to tensor, and normalize
     data_transforms = load_transforms()
 
-    # Load the full dataset from the augmented data directory
-    full_dataset = datasets.ImageFolder(root=data_dir, transform=data_transforms)
+    # Load the train dataset from the augmented data directory
+    train_dataset = datasets.ImageFolder(root=data_dir, transform=data_transforms)
 
-    # Split the dataset into training and validation sets (80/20 split)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator()
-    )
+    # Load the validation dataset from the raw data directory
+    val_dataset = datasets.ImageFolder(root=data_dir + "/../../raw/val", transform=data_transforms)
 
     # Create data loaders for training and validation
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
@@ -48,9 +45,8 @@ def load_data(data_dir, batch_size):
 
     # Print dataset summary
     print(f"Dataset loaded from: {data_dir}")
-    print(f"Total images: {len(full_dataset)}")
-    print(f"Number of classes: {len(full_dataset.classes)}")
-    print(f"Class names: {full_dataset.classes}")
+    print(f"Number of classes: {len(train_dataset.classes)}")
+    print(f"Class names: {train_dataset.classes}")
     print(f"Training set size: {len(train_dataset)}")
     print(f"Validation set size: {len(val_dataset)}")
 
