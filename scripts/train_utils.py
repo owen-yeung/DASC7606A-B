@@ -67,16 +67,19 @@ def load_data(root_dir: str, batch_size: int, num_workers: int = None, policy: s
 
     # Determine if root_dir is an ImageFolder directory (classes as subfolders)
     if os.path.isdir(root_dir):
-        # Use ImageFolder and split
-        full_dataset = datasets.ImageFolder(root=root_dir, transform=load_transforms("train", policy))
-        train_size = int(0.8 * len(full_dataset))
-        val_size = len(full_dataset) - train_size
-        train_dataset, val_dataset = random_split(
-            full_dataset, [train_size, val_size],
-            generator=torch.Generator()
-        )
-        # Override val transform to evaluation transforms
-        val_dataset.dataset.transform = load_transforms("test", policy)
+        # Use ImageFolder with separate instances for train/val transforms
+        ds_train_full = datasets.ImageFolder(root=root_dir, transform=load_transforms("train", policy))
+        ds_val_full = datasets.ImageFolder(root=root_dir, transform=load_transforms("test", policy))
+        # Consistent split indices
+        total_len = len(ds_train_full)
+        train_size = int(0.8 * total_len)
+        val_size = total_len - train_size
+        generator = torch.Generator()
+        train_subset, val_subset = random_split(range(total_len), [train_size, val_size], generator=generator)
+        # Apply indices to respective datasets
+        from torch.utils.data import Subset
+        train_dataset = Subset(ds_train_full, train_subset.indices)
+        val_dataset = Subset(ds_val_full, val_subset.indices)
     else:
         # Fallback to TorchVision CIFAR-100 datasets
         train_dataset = datasets.CIFAR100(root=root_dir, train=True, download=True, transform=load_transforms("train", policy))
