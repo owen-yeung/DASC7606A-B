@@ -5,74 +5,106 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import os
+from typing import Tuple
 
-def load_transforms():
-    """
-    Load the data transformations
-    """
-    return transforms.Compose([
-        transforms.Resize((32, 32)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
 
-def load_data(data_dir, batch_size):
+# CIFAR-100 normalization stats
+CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
+CIFAR100_STD = (0.2675, 0.2565, 0.2761)
+
+def load_transforms(split: str = "train", policy: str = "randaugment"):
     """
-    Load the data from the data directory and split it into training and validation sets
-    This function is similar to the cell 2. Data Preparation in 04_model_training.ipynb
+    Load the data transformations for a given split.
+    """
+    if split == "train":
+        aug = []
+        # Traditional CIFAR augmentations
+        aug.append(transforms.RandomCrop(32, padding=4))
+        aug.append(transforms.RandomHorizontalFlip())
+        # Policy
+        if policy == "autoaugment":
+            try:
+                aug.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
+            except AttributeError:
+                pass
+        else:
+            try:
+                aug.append(transforms.RandAugment(num_ops=2, magnitude=9))
+            except AttributeError:
+                pass
+        aug.extend([
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+            transforms.RandomErasing(p=0.25),
+        ])
+        return transforms.Compose(aug)
+    else:
+        return transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+        ])
+
+def load_data(root_dir: str, batch_size: int, num_workers: int = None, policy: str = "randaugment") -> Tuple[DataLoader, DataLoader]:
+    """
+    Load CIFAR-100 train and test sets with on-the-fly augmentations.
 
     Args:
-        data_dir: The directory to load the data from
+        root_dir: Base data directory (torchvision will store under this path)
         batch_size: The batch size to use for the data loaders
+        num_workers: DataLoader workers (defaults to half of CPUs)
+        policy: Augment policy ("randaugment" | "autoaugment")
     Returns:
-        train_loader: The training data loader
-        val_loader: The validation data loader
+        train_loader, val_loader
     """
-    # Define data transformations: resize, convert to tensor, and normalize
-    data_transforms = load_transforms()
+    if num_workers is None:
+        try:
+            num_workers = max(2, os.cpu_count() // 2)
+        except Exception:
+            num_workers = 2
 
-    # Load the full dataset from the augmented data directory
-    full_dataset = datasets.ImageFolder(root=data_dir, transform=data_transforms)
+    train_tf = load_transforms("train", policy)
+    test_tf = load_transforms("test", policy)
 
-    # Split the dataset into training and validation sets (80/20 split)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator()
+    train_dataset = datasets.CIFAR100(root=root_dir, train=True, download=True, transform=train_tf)
+    val_dataset = datasets.CIFAR100(root=root_dir, train=False, download=True, transform=test_tf)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
     )
 
-    # Create data loaders for training and validation
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    # Print dataset summary
-    print(f"Dataset loaded from: {data_dir}")
-    print(f"Total images: {len(full_dataset)}")
-    print(f"Number of classes: {len(full_dataset.classes)}")
-    print(f"Class names: {full_dataset.classes}")
-    print(f"Training set size: {len(train_dataset)}")
-    print(f"Validation set size: {len(val_dataset)}")
+    print(f"CIFAR-100 loaded under: {root_dir}")
+    print(f"Training set size: {len(train_dataset)} | Validation set size: {len(val_dataset)}")
 
     return train_loader, val_loader
 
 
-def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float):
+def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float, t_max: int = 100):
     """
     Define the loss function and optimizer
-    This function is similar to the cell 3. Model Configuration in 04_model_training.ipynb
     Args:
         model: The model to train
         lr: Learning rate
         weight_decay: Weight decay
+        t_max: T_max for CosineAnnealingLR (typically num_epochs)
     Returns:
         criterion: The loss function
         optimizer: The optimizer
         scheduler: The scheduler
     """
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=lr * 1e-3)
     return criterion, optimizer, scheduler
 
 
@@ -95,18 +127,21 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
 
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
 
+    autocast_device = "cuda" if device == "cuda" else ("mps" if device == "mps" else "cpu")
+
     for inputs, labels in progress_bar:
         inputs, labels = inputs.to(device), labels.to(device)
 
-        # Zero the parameter gradients
         optimizer.zero_grad()
 
-        # Forward pass
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
+        # Forward pass with AMP autocast (works on CUDA/MPS; on CPU it’s a no-op)
+        with torch.autocast(device_type=autocast_device, dtype=torch.float16 if autocast_device != "cpu" else torch.bfloat16, enabled=(autocast_device != "cpu")):
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
 
         # Backward pass and optimize
         loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         # Statistics
@@ -145,12 +180,15 @@ def validate_epoch(model, dataloader, criterion, device):
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
 
+        autocast_device = "cuda" if device == "cuda" else ("mps" if device == "mps" else "cpu")
+
         for inputs, labels in progress_bar:
             inputs, labels = inputs.to(device), labels.to(device)
 
             # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            with torch.autocast(device_type=autocast_device, dtype=torch.float16 if autocast_device != "cpu" else torch.bfloat16, enabled=(autocast_device != "cpu")):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
 
             # Statistics
             running_loss += loss.item() * inputs.size(0)

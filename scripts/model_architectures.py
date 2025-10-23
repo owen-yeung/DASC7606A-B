@@ -8,7 +8,7 @@ class SimpleCNN(nn.Module):
     A simple CNN architecture for image classification
     """
 
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=100):
         super(SimpleCNN, self).__init__()
         # Convolutional layers: progressively increase number of filters (3 -> 32 -> 64 -> 128)
         # 3x3 kernels with padding=1 maintain spatial dimensions before pooling
@@ -30,8 +30,23 @@ class SimpleCNN(nn.Module):
         x = self.fc2(x)
         return x
 
-def create_model(num_classes, device):
-    """Create and initialize the model"""
-    model = SimpleCNN(num_classes=num_classes)
+def create_resnet18_cifar(num_classes: int = 100) -> nn.Module:
+    """ResNet18 adapted for 32x32 inputs (no initial downsampling)."""
+    model = models.resnet18(num_classes=num_classes)
+    # Replace the initial conv and remove maxpool for CIFAR-sized images
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = nn.Identity()
+    return model
+
+
+def create_model(num_classes: int, device, model_name: str = "resnet18_cifar"):
+    """Create and initialize the model by name. Backward-compatible signature."""
+    if model_name == "resnet18_cifar":
+        model = create_resnet18_cifar(num_classes=num_classes)
+    elif model_name == "simple_cnn":
+        model = SimpleCNN(num_classes=num_classes)
+    else:
+        # default to SimpleCNN if unknown
+        model = SimpleCNN(num_classes=num_classes)
     model = model.to(device)
     return model
