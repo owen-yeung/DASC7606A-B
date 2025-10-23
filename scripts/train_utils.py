@@ -12,16 +12,15 @@ from typing import Tuple
 CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
 CIFAR100_STD = (0.2675, 0.2565, 0.2761)
 
-def load_transforms(split: str = "train", policy: str = "randaugment"):
+def load_transforms(split: str = "test", policy: str = "randaugment"):
     """
     Load the data transformations for a given split.
+    Default to 'test' to remain compatible with main.py's evaluation call.
     """
     if split == "train":
         aug = []
-        # Traditional CIFAR augmentations
         aug.append(transforms.RandomCrop(32, padding=4))
         aug.append(transforms.RandomHorizontalFlip())
-        # Policy
         if policy == "autoaugment":
             try:
                 aug.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
@@ -29,27 +28,29 @@ def load_transforms(split: str = "train", policy: str = "randaugment"):
                 pass
         else:
             try:
-                aug.append(transforms.RandAugment(num_ops=2, magnitude=9))
+                aug.append(transforms.RandAugment(num_ops=2, magnitude=11))
             except AttributeError:
                 pass
         aug.extend([
             transforms.ToTensor(),
             transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
-            transforms.RandomErasing(p=0.25),
+            transforms.RandomErasing(p=0.4),
         ])
         return transforms.Compose(aug)
-    else:
-        return transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
-        ])
+    # test/val
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+    ])
 
 def load_data(root_dir: str, batch_size: int, num_workers: int = None, policy: str = "randaugment") -> Tuple[DataLoader, DataLoader]:
     """
-    Load CIFAR-100 train and test sets with on-the-fly augmentations.
+    Load data for training/validation.
+    - If 'root_dir' points to an ImageFolder root, split 80/20 and use on-the-fly transforms.
+    - Otherwise, fallback to TorchVision CIFAR-100 datasets under 'root_dir'.
 
     Args:
-        root_dir: Base data directory (torchvision will store under this path)
+        root_dir: Either ImageFolder root (augmented) or TorchVision base directory
         batch_size: The batch size to use for the data loaders
         num_workers: DataLoader workers (defaults to half of CPUs)
         policy: Augment policy ("randaugment" | "autoaugment")
@@ -62,11 +63,24 @@ def load_data(root_dir: str, batch_size: int, num_workers: int = None, policy: s
         except Exception:
             num_workers = 2
 
-    train_tf = load_transforms("train", policy)
-    test_tf = load_transforms("test", policy)
+    pin = torch.cuda.is_available()
 
-    train_dataset = datasets.CIFAR100(root=root_dir, train=True, download=True, transform=train_tf)
-    val_dataset = datasets.CIFAR100(root=root_dir, train=False, download=True, transform=test_tf)
+    # Determine if root_dir is an ImageFolder directory (classes as subfolders)
+    if os.path.isdir(root_dir):
+        # Use ImageFolder and split
+        full_dataset = datasets.ImageFolder(root=root_dir, transform=load_transforms("train", policy))
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = random_split(
+            full_dataset, [train_size, val_size],
+            generator=torch.Generator()
+        )
+        # Override val transform to evaluation transforms
+        val_dataset.dataset.transform = load_transforms("test", policy)
+    else:
+        # Fallback to TorchVision CIFAR-100 datasets
+        train_dataset = datasets.CIFAR100(root=root_dir, train=True, download=True, transform=load_transforms("train", policy))
+        val_dataset = datasets.CIFAR100(root=root_dir, train=False, download=True, transform=load_transforms("test", policy))
 
     train_loader = DataLoader(
         train_dataset,
@@ -74,6 +88,7 @@ def load_data(root_dir: str, batch_size: int, num_workers: int = None, policy: s
         shuffle=True,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
+        pin_memory=pin,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -81,10 +96,19 @@ def load_data(root_dir: str, batch_size: int, num_workers: int = None, policy: s
         shuffle=False,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
+        pin_memory=pin,
     )
 
     print(f"CIFAR-100 loaded under: {root_dir}")
-    print(f"Training set size: {len(train_dataset)} | Validation set size: {len(val_dataset)}")
+    try:
+        tr_len = len(train_dataset)
+    except Exception:
+        tr_len = "unknown"
+    try:
+        va_len = len(val_dataset)
+    except Exception:
+        va_len = "unknown"
+    print(f"Training set size: {tr_len} | Validation set size: {va_len}")
 
     return train_loader, val_loader
 
@@ -96,7 +120,7 @@ def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float, 
         model: The model to train
         lr: Learning rate
         weight_decay: Weight decay
-        t_max: T_max for CosineAnnealingLR (typically num_epochs)
+        t_max: Unused; kept for backward compatibility if needed
     Returns:
         criterion: The loss function
         optimizer: The optimizer
@@ -104,7 +128,8 @@ def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float, 
     """
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=lr * 1e-3)
+    # Keep ReduceLROnPlateau for compatibility with main.py's scheduler.step(val_loss)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
     return criterion, optimizer, scheduler
 
 
@@ -127,22 +152,29 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
 
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
 
-    autocast_device = "cuda" if device == "cuda" else ("mps" if device == "mps" else "cpu")
+    use_cuda = torch.cuda.is_available() and device == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_cuda else None
 
     for inputs, labels in progress_bar:
-        inputs, labels = inputs.to(device), labels.to(device)
-
-        optimizer.zero_grad()
-
-        # Forward pass with AMP autocast (works on CUDA/MPS; on CPU it’s a no-op)
-        with torch.autocast(device_type=autocast_device, dtype=torch.float16 if autocast_device != "cpu" else torch.bfloat16, enabled=(autocast_device != "cpu")):
+        if use_cuda:
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast():
+                inputs = inputs.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+                labels = labels.to(device, non_blocking=True)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad(set_to_none=True)
             outputs = model(inputs)
             loss = criterion(outputs, labels)
-
-        # Backward pass and optimize
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         # Statistics
         running_loss += loss.item() * inputs.size(0)
@@ -180,13 +212,15 @@ def validate_epoch(model, dataloader, criterion, device):
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
 
-        autocast_device = "cuda" if device == "cuda" else ("mps" if device == "mps" else "cpu")
-
         for inputs, labels in progress_bar:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            # Forward pass
-            with torch.autocast(device_type=autocast_device, dtype=torch.float16 if autocast_device != "cpu" else torch.bfloat16, enabled=(autocast_device != "cpu")):
+            if torch.cuda.is_available() and device == "cuda":
+                with torch.cuda.amp.autocast():
+                    inputs = inputs.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+                    labels = labels.to(device, non_blocking=True)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+            else:
+                inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
 
