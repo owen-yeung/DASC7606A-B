@@ -57,7 +57,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="CIFAR-10/100 Training Pipeline")
 
     # Dataset selection
-    parser.add_argument("--dataset", type=str, choices=["cifar10", "cifar100"], default="cifar100",
+    parser.add_argument("--dataset", type=str, choices=["cifar10", "cifar100"], default="cifar10",
                         help="Dataset to use (cifar10 or cifar100)")
 
     # Data paths
@@ -73,11 +73,11 @@ def parse_args():
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Batch size for training")
-    parser.add_argument("--num_epochs", type=int, default=100,
+    parser.add_argument("--num_epochs", type=int, default=30,
                         help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.1,
+    parser.add_argument("--lr", type=float, default=0.001,
                         help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=5e-4,
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
                         help="Weight decay (L2 penalty)")
 
     # Checkpointing
@@ -87,13 +87,8 @@ def parse_args():
                         help="Early stopping patience")
 
     # Hardware
-    default_device = (
-        "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else (
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-    )
-    parser.add_argument("--device", type=str, default=default_device,
-                        help="Device to use for training (mps/cuda/cpu)")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
+                        help="Device to use for training (cuda/cpu)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of data loading workers")
 
@@ -113,14 +108,12 @@ def collect_data(args):
     print("Setup complete.")
 
     if args.dataset == "cifar10":
-        download_and_extract_cifar10_data(
+        train_dataset, test_dataset = download_and_extract_cifar10_data(
             root_dir=args.data_dir + "/raw",
-            save_images=False,
         )
     else:
-        download_and_extract_cifar100_data(
+        train_dataset, test_dataset = download_and_extract_cifar100_data(
             root_dir=args.data_dir + "/raw",
-            save_images=False,
         )
 
 def augment_data(args):
@@ -162,12 +155,12 @@ def build_model(args):
     else:
         num_classes = 100
     logger.info(f"Creating model with {num_classes} classes, {args.device} device...")
-    model = create_model(num_classes=num_classes, device=args.device, model_name="resnet18_cifar")
+    model = create_model(num_classes=num_classes, device=args.device)
     return model
 
 def train(args, model: nn.Module):
     # Define loss and optimizer
-    criterion, optimizer, scheduler = define_loss_and_optimizer(model, args.lr, args.weight_decay, t_max=args.num_epochs)
+    criterion, optimizer, scheduler = define_loss_and_optimizer(model, args.lr, args.weight_decay)
 
     # Initialize tracking variables
     best_val_loss = float("inf")
@@ -185,8 +178,8 @@ def train(args, model: nn.Module):
 
     print(f"Training configured for {args.num_epochs} epochs with early stopping patience of {args.early_stopping_patience}.")
 
-    # Load data (TorchVision CIFAR datasets with on-the-fly aug)
-    train_loader, val_loader = load_data(args.data_dir + "/raw", args.batch_size)
+    # Load data
+    train_loader, val_loader = load_data(args.data_dir + "/augmented/train", args.batch_size)
 
     print("Starting training...")
     for epoch in range(args.num_epochs):
@@ -198,8 +191,8 @@ def train(args, model: nn.Module):
         # Validate the model
         val_loss, val_acc = validate_epoch(model, val_loader, criterion, args.device)
 
-        # Step cosine scheduler once per epoch
-        scheduler.step()
+        # Update learning rate based on validation loss
+        scheduler.step(val_loss)
 
         # Store metrics for plotting
         train_losses.append(train_loss)
@@ -258,13 +251,9 @@ def train(args, model: nn.Module):
 
 def evaluate(args, model: nn.Module):
     """Evaluate the model on test data"""
-    # Load CIFAR test set with evaluation transforms
-    if args.dataset == "cifar10":
-        test_dataset = datasets.CIFAR10(root=args.data_dir + "/raw", train=False, download=True, transform=load_transforms("test"))
-        class_names = test_dataset.classes
-    else:
-        test_dataset = datasets.CIFAR100(root=args.data_dir + "/raw", train=False, download=True, transform=load_transforms("test"))
-        class_names = test_dataset.classes
+    # Load the test dataset from the specified directory
+    test_data_dir = args.data_dir + "/raw/test"
+    test_dataset = datasets.ImageFolder(root=test_data_dir, transform=load_transforms())
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # Set the model to evaluation mode
@@ -277,7 +266,7 @@ def evaluate(args, model: nn.Module):
     test_loss, test_accuracy, all_preds, all_labels, all_probs = evaluate_model(
         model, test_loader, criterion, args.device
     )
-    metrics_str = classification_report(all_labels, all_preds, target_names=class_names)
+    metrics_str = classification_report(all_labels, all_preds, target_names=test_dataset.classes)
 
     save_metrics(metrics_str)
 
