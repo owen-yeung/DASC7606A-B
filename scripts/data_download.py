@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import torchvision.transforms as transforms
 from torchvision.datasets import CIFAR10, CIFAR100
+import json
 
 # Configure module-level logger
 logging.basicConfig(level=logging.INFO)
@@ -76,11 +77,20 @@ class CIFAR10Downloader:
             RuntimeError: If dataset fails to download or load.
         """
         try:
+            # If dataset already present, avoid re-downloading
+            try:
+                _ = CIFAR10(root=str(self.root_dir), train=True, download=False)
+                _ = CIFAR10(root=str(self.root_dir), train=False, download=False)
+                effective_download = False
+                logger.info("CIFAR-10 detected locally. Skipping download.")
+            except Exception:
+                effective_download = self.download
+
             logger.info("Loading CIFAR-10 training dataset...")
             train_dataset = CIFAR10(
                 root=str(self.root_dir),
                 train=True,
-                download=self.download,
+                download=effective_download,
                 transform=self.transform,
             )
 
@@ -88,7 +98,7 @@ class CIFAR10Downloader:
             test_dataset = CIFAR10(
                 root=str(self.root_dir),
                 train=False,
-                download=self.download,
+                download=effective_download,
                 transform=self.transform,
             )
 
@@ -222,11 +232,20 @@ class CIFAR100Downloader:
             RuntimeError: If dataset fails to download or load.
         """
         try:
+            # If dataset already present, avoid re-downloading
+            try:
+                _ = CIFAR100(root=str(self.root_dir), train=True, download=False)
+                _ = CIFAR100(root=str(self.root_dir), train=False, download=False)
+                effective_download = False
+                logger.info("CIFAR-100 detected locally. Skipping download.")
+            except Exception:
+                effective_download = self.download
+
             logger.info("Loading CIFAR-100 training dataset...")
             train_dataset = CIFAR100(
                 root=str(self.root_dir),
                 train=True,
-                download=self.download,
+                download=effective_download,
                 transform=self.transform,
             )
             
@@ -234,7 +253,7 @@ class CIFAR100Downloader:
             test_dataset = CIFAR100(
                 root=str(self.root_dir),
                 train=False,
-                download=self.download,
+                download=effective_download,
                 transform=self.transform,
             )
             
@@ -346,7 +365,23 @@ def download_and_extract_cifar10_data(
     train_dataset, test_dataset = downloader.load_datasets()
 
     if save_images:
-        downloader.save_images_to_folders(train_dataset, test_dataset)
+        # Idempotency marker for exported images
+        marker = Path(root_dir) / ".images_export_done_cifar10.json"
+        if marker.exists():
+            try:
+                info = json.loads(marker.read_text())
+                logger.info(
+                    f"Image export previously completed (marker: {info}). Skipping export."
+                )
+            except Exception:
+                logger.warning("Existing CIFAR-10 image export marker unreadable. Re-exporting.")
+                downloader.save_images_to_folders(train_dataset, test_dataset)
+        else:
+            downloader.save_images_to_folders(train_dataset, test_dataset)
+            try:
+                marker.write_text(json.dumps({"root_dir": str(root_dir)}, indent=2))
+            except Exception as e:
+                logger.warning(f"Failed to write CIFAR-10 export marker: {e}")
 
     return train_dataset, test_dataset
 
@@ -386,6 +421,22 @@ def download_and_extract_cifar100_data(
     train_dataset, test_dataset = downloader.load_datasets()
 
     if save_images:
-        downloader.save_images_to_folders(train_dataset, test_dataset)
+        # Idempotency marker for exported images
+        marker = Path(root_dir) / ".images_export_done_cifar100.json"
+        if marker.exists():
+            try:
+                info = json.loads(marker.read_text())
+                logger.info(
+                    f"Image export previously completed (marker: {info}). Skipping export."
+                )
+            except Exception:
+                logger.warning("Existing CIFAR-100 image export marker unreadable. Re-exporting.")
+                downloader.save_images_to_folders(train_dataset, test_dataset)
+        else:
+            downloader.save_images_to_folders(train_dataset, test_dataset)
+            try:
+                marker.write_text(json.dumps({"root_dir": str(root_dir)}, indent=2))
+            except Exception as e:
+                logger.warning(f"Failed to write CIFAR-100 export marker: {e}")
 
     return train_dataset, test_dataset
