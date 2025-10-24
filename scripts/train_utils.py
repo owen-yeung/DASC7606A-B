@@ -6,7 +6,9 @@ from torch.utils.data import DataLoader, random_split, Subset
 from tqdm import tqdm
 import os
 import numpy as np
-from typing import Tuple
+import json
+from pathlib import Path
+from typing import Tuple, Optional
 
 
 # CIFAR-100 normalization stats
@@ -159,7 +161,7 @@ def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float, 
     return criterion, optimizer, scheduler
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch_num=None):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch_num=None, diagnostics_dir: Optional[str] = None):
     """
     Train the model for one epoch
     Args:
@@ -169,6 +171,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch_num=None)
         optimizer: Optimizer
         device: Device to train on
         epoch_num: Current epoch number for diagnostics (optional, for backward compat)
+        diagnostics_dir: Directory to save diagnostic logs (optional, defaults to 'results/diagnostics')
     Returns:
         Average loss and accuracy for the epoch
     """
@@ -178,6 +181,10 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch_num=None)
             epoch_num = 0 if len(optimizer.state) == 0 else 1
         except Exception:
             epoch_num = 0
+    
+    # Auto-enable diagnostics if not specified
+    if diagnostics_dir is None:
+        diagnostics_dir = os.environ.get('DIAGNOSTICS_DIR', 'results/diagnostics')
     model.train()
     running_loss = 0.0
     correct = 0
@@ -188,15 +195,15 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch_num=None)
     use_cuda = torch.cuda.is_available() and device == "cuda"
     scaler = torch.cuda.amp.GradScaler() if use_cuda else None
     
-    # DIAGNOSTIC: Capture initial weights for epoch 0
-    if epoch_num == 0:
-        try:
-            first_param = next(model.parameters())
-            initial_weights = first_param.data.clone()
-            print("\n[DIAGNOSTIC] Epoch 0 - Captured initial weights for verification")
-        except Exception:
-            initial_weights = None
-    else:
+    # Track diagnostics throughout training
+    grad_norms = []
+    batch_losses = []
+    
+    # Capture initial weights to measure change
+    try:
+        first_param = next(model.parameters())
+        initial_weights = first_param.data.clone()
+    except Exception:
         initial_weights = None
 
     for inputs, labels in progress_bar:
@@ -208,43 +215,28 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch_num=None)
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # CRITICAL FIX: Unscale gradients before clipping when using AMP
+            scaler.unscale_(optimizer)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            grad_norms.append(float(grad_norm.item()) if hasattr(grad_norm, 'item') else float(grad_norm))
         else:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad(set_to_none=True)
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            grad_norms.append(float(grad_norm.item()) if hasattr(grad_norm, 'item') else float(grad_norm))
 
         # Statistics
         running_loss += loss.item() * inputs.size(0)
+        batch_losses.append(loss.item())
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-        
-        # DIAGNOSTIC: First batch checks in epoch 0
-        if epoch_num == 0 and total == labels.size(0):
-            print("\n[DIAGNOSTIC] First batch of epoch 0:")
-            print(f"  Input shape: {inputs.shape}, dtype: {inputs.dtype}")
-            print(f"  Input mean: {inputs.mean().item():.4f}, std: {inputs.std().item():.4f}")
-            print(f"  Labels shape: {labels.shape}, unique: {torch.unique(labels).numel()}")
-            print(f"  Output shape: {outputs.shape}")
-            print(f"  Loss: {loss.item():.4f}")
-            # Check gradients
-            try:
-                first_param = next(model.parameters())
-                if first_param.grad is not None:
-                    grad_norm = first_param.grad.norm().item()
-                    print(f"  First param grad norm: {grad_norm:.6f}")
-                    assert grad_norm > 0, "BUG: Gradients are zero!"
-                else:
-                    print("  WARNING: First param grad is None!")
-            except Exception as e:
-                print(f"  Could not check gradients: {e}")
 
         # Update progress bar
         progress_bar.set_postfix(
@@ -254,31 +246,66 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch_num=None)
     epoch_loss = running_loss / total
     epoch_acc = 100.0 * correct / total
     
-    # DIAGNOSTIC: Verify weights changed in epoch 0
-    if epoch_num == 0 and initial_weights is not None:
+    # Compute weight change
+    weight_change = 0.0
+    if initial_weights is not None:
         try:
             first_param = next(model.parameters())
-            weight_diff = (first_param.data - initial_weights).abs().max().item()
-            print(f"\n[DIAGNOSTIC] Epoch 0 complete - Max weight change: {weight_diff:.6f}")
-            if weight_diff < 1e-7:
-                print("  WARNING: Weights barely changed! Optimizer may not be working.")
-        except Exception as e:
-            print(f"  Could not verify weight update: {e}")
+            weight_change = (first_param.data - initial_weights).abs().max().item()
+        except Exception:
+            pass
+    
+    # Get current learning rate
+    current_lr = optimizer.param_groups[0]['lr']
+    
+    # Save diagnostics to file
+    if diagnostics_dir is not None:
+        diag_path = Path(diagnostics_dir)
+        diag_path.mkdir(parents=True, exist_ok=True)
+        diag_file = diag_path / "train_diagnostics.jsonl"
+        
+        diag_record = {
+            "epoch": epoch_num,
+            "loss": float(epoch_loss),
+            "accuracy": float(epoch_acc),
+            "learning_rate": float(current_lr),
+            "mean_grad_norm": float(np.mean(grad_norms)) if grad_norms else 0.0,
+            "max_grad_norm": float(np.max(grad_norms)) if grad_norms else 0.0,
+            "min_grad_norm": float(np.min(grad_norms)) if grad_norms else 0.0,
+            "mean_batch_loss": float(np.mean(batch_losses)) if batch_losses else 0.0,
+            "max_weight_change": float(weight_change),
+            "num_batches": len(batch_losses),
+        }
+        
+        with open(diag_file, 'a') as f:
+            f.write(json.dumps(diag_record) + '\n')
+    
+    # Print summary for important epochs
+    if epoch_num < 3 or epoch_num % 10 == 0:
+        print(f"\n[DIAGNOSTIC] Epoch {epoch_num}:")
+        print(f"  LR: {current_lr:.6f}")
+        print(f"  Mean grad norm: {np.mean(grad_norms):.6f}" if grad_norms else "  No grad norms")
+        print(f"  Max weight change: {weight_change:.6f}")
 
     return epoch_loss, epoch_acc
 
 
-def validate_epoch(model, dataloader, criterion, device):
+def validate_epoch(model, dataloader, criterion, device, epoch_num=None, diagnostics_dir: Optional[str] = None):
     """
     Validate the model
     Args:
         model: The model to validate
         dataloader: DataLoader for validation data
         criterion: Loss function
-        device: Device to validate on
+        device: Device to use
+        epoch_num: Current epoch number for diagnostics (optional)
+        diagnostics_dir: Directory to save diagnostic logs (optional)
     Returns:
         Average loss and accuracy for the validation set
     """
+    # Auto-enable diagnostics if not specified
+    if diagnostics_dir is None:
+        diagnostics_dir = os.environ.get('DIAGNOSTICS_DIR', 'results/diagnostics')
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -312,6 +339,21 @@ def validate_epoch(model, dataloader, criterion, device):
 
     epoch_loss = running_loss / total
     epoch_acc = 100.0 * correct / total
+    
+    # Save validation diagnostics to file
+    if diagnostics_dir is not None and epoch_num is not None:
+        diag_path = Path(diagnostics_dir)
+        diag_path.mkdir(parents=True, exist_ok=True)
+        diag_file = diag_path / "val_diagnostics.jsonl"
+        
+        diag_record = {
+            "epoch": epoch_num,
+            "loss": float(epoch_loss),
+            "accuracy": float(epoch_acc),
+        }
+        
+        with open(diag_file, 'a') as f:
+            f.write(json.dumps(diag_record) + '\n')
 
     return epoch_loss, epoch_acc
 
