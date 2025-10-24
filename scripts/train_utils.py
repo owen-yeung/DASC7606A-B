@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from tqdm import tqdm
 import os
+import numpy as np
 from typing import Tuple
 
 
@@ -67,19 +68,28 @@ def load_data(root_dir: str, batch_size: int, num_workers: int = None, policy: s
 
     # Determine if root_dir is an ImageFolder directory (classes as subfolders)
     if os.path.isdir(root_dir):
-        # Use ImageFolder with separate instances for train/val transforms
+        # CRITICAL FIX: Use separate ImageFolder instances for train/val to avoid transform override bug
         ds_train_full = datasets.ImageFolder(root=root_dir, transform=load_transforms("train", policy))
         ds_val_full = datasets.ImageFolder(root=root_dir, transform=load_transforms("test", policy))
+        
         # Consistent split indices
         total_len = len(ds_train_full)
         train_size = int(0.8 * total_len)
         val_size = total_len - train_size
-        generator = torch.Generator()
-        train_subset, val_subset = random_split(range(total_len), [train_size, val_size], generator=generator)
+        generator = torch.Generator().manual_seed(42)
+        indices = list(range(total_len))
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
+        
         # Apply indices to respective datasets
-        from torch.utils.data import Subset
-        train_dataset = Subset(ds_train_full, train_subset.indices)
-        val_dataset = Subset(ds_val_full, val_subset.indices)
+        train_dataset = Subset(ds_train_full, train_indices)
+        val_dataset = Subset(ds_val_full, val_indices)
+        
+        # DIAGNOSTIC: Verify transforms are different
+        print("\n[DIAGNOSTIC] Checking transforms...")
+        print(f"  Train transform: {ds_train_full.transform}")
+        print(f"  Val transform: {ds_val_full.transform}")
+        assert ds_train_full.transform != ds_val_full.transform, "BUG: Train and val transforms are identical!"
     else:
         # Fallback to TorchVision CIFAR-100 datasets
         train_dataset = datasets.CIFAR100(root=root_dir, train=True, download=True, transform=load_transforms("train", policy))
@@ -112,6 +122,19 @@ def load_data(root_dir: str, batch_size: int, num_workers: int = None, policy: s
     except Exception:
         va_len = "unknown"
     print(f"Training set size: {tr_len} | Validation set size: {va_len}")
+    
+    # DIAGNOSTIC: Check label distribution in first batch
+    print("\n[DIAGNOSTIC] Sampling labels from train loader...")
+    try:
+        sample_batch = next(iter(train_loader))
+        sample_labels = sample_batch[1].numpy()
+        print(f"  Sample batch labels (first 20): {sample_labels[:20]}")
+        print(f"  Unique labels in batch: {len(np.unique(sample_labels))}")
+        print(f"  Min label: {sample_labels.min()}, Max label: {sample_labels.max()}")
+        assert sample_labels.min() >= 0, "BUG: Negative labels detected!"
+        assert sample_labels.max() < 100, "BUG: Labels exceed num_classes!"
+    except Exception as e:
+        print(f"  Warning: Could not verify labels: {e}")
 
     return train_loader, val_loader
 
@@ -136,7 +159,7 @@ def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float, 
     return criterion, optimizer, scheduler
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch_num=None):
     """
     Train the model for one epoch
     Args:
@@ -145,9 +168,16 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         criterion: Loss function
         optimizer: Optimizer
         device: Device to train on
+        epoch_num: Current epoch number for diagnostics (optional, for backward compat)
     Returns:
         Average loss and accuracy for the epoch
     """
+    # Auto-detect if this is first epoch by checking if optimizer has state
+    if epoch_num is None:
+        try:
+            epoch_num = 0 if len(optimizer.state) == 0 else 1
+        except Exception:
+            epoch_num = 0
     model.train()
     running_loss = 0.0
     correct = 0
@@ -157,6 +187,17 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
 
     use_cuda = torch.cuda.is_available() and device == "cuda"
     scaler = torch.cuda.amp.GradScaler() if use_cuda else None
+    
+    # DIAGNOSTIC: Capture initial weights for epoch 0
+    if epoch_num == 0:
+        try:
+            first_param = next(model.parameters())
+            initial_weights = first_param.data.clone()
+            print("\n[DIAGNOSTIC] Epoch 0 - Captured initial weights for verification")
+        except Exception:
+            initial_weights = None
+    else:
+        initial_weights = None
 
     for inputs, labels in progress_bar:
         if use_cuda:
@@ -184,6 +225,26 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
+        
+        # DIAGNOSTIC: First batch checks in epoch 0
+        if epoch_num == 0 and total == labels.size(0):
+            print("\n[DIAGNOSTIC] First batch of epoch 0:")
+            print(f"  Input shape: {inputs.shape}, dtype: {inputs.dtype}")
+            print(f"  Input mean: {inputs.mean().item():.4f}, std: {inputs.std().item():.4f}")
+            print(f"  Labels shape: {labels.shape}, unique: {torch.unique(labels).numel()}")
+            print(f"  Output shape: {outputs.shape}")
+            print(f"  Loss: {loss.item():.4f}")
+            # Check gradients
+            try:
+                first_param = next(model.parameters())
+                if first_param.grad is not None:
+                    grad_norm = first_param.grad.norm().item()
+                    print(f"  First param grad norm: {grad_norm:.6f}")
+                    assert grad_norm > 0, "BUG: Gradients are zero!"
+                else:
+                    print("  WARNING: First param grad is None!")
+            except Exception as e:
+                print(f"  Could not check gradients: {e}")
 
         # Update progress bar
         progress_bar.set_postfix(
@@ -192,6 +253,17 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
 
     epoch_loss = running_loss / total
     epoch_acc = 100.0 * correct / total
+    
+    # DIAGNOSTIC: Verify weights changed in epoch 0
+    if epoch_num == 0 and initial_weights is not None:
+        try:
+            first_param = next(model.parameters())
+            weight_diff = (first_param.data - initial_weights).abs().max().item()
+            print(f"\n[DIAGNOSTIC] Epoch 0 complete - Max weight change: {weight_diff:.6f}")
+            if weight_diff < 1e-7:
+                print("  WARNING: Weights barely changed! Optimizer may not be working.")
+        except Exception as e:
+            print(f"  Could not verify weight update: {e}")
 
     return epoch_loss, epoch_acc
 
