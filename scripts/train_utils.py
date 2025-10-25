@@ -185,8 +185,19 @@ def train_epoch_advanced(model, dataloader, criterion, optimizer, scheduler, sca
     correct = 0
     total = 0
     start_epoch_time = time.time()
+    start_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[train]    epoch {_EPOCH_COUNTER} start: {start_ts}")
+    _logger.info(f"train epoch {_EPOCH_COUNTER} start: {start_ts}")
 
-    progress_bar = tqdm(dataloader, desc="Training", leave=False)
+    progress_bar = tqdm(
+        dataloader,
+        desc=f"Training (epoch {_EPOCH_COUNTER})",
+        leave=False,
+        dynamic_ncols=True,
+        mininterval=0.1,
+        smoothing=0.1,
+        ascii=True,
+    )
 
     for inputs, labels in progress_bar:
         inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -271,6 +282,9 @@ def train_epoch_advanced(model, dataloader, criterion, optimizer, scheduler, sca
         fieldnames=["epoch", "train_loss", "train_acc", "epoch_time_sec"],
     )
     _logger.info(f"Epoch {_EPOCH_COUNTER} train: loss={epoch_loss:.4f}, acc={epoch_acc:.2f}%, time={epoch_time:.1f}s")
+    end_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[train]    epoch {_EPOCH_COUNTER} end:   {end_ts}")
+    _logger.info(f"train epoch {_EPOCH_COUNTER} end: {end_ts}")
 
     return epoch_loss, epoch_acc
 
@@ -307,9 +321,20 @@ def validate_epoch(model, dataloader, criterion, device, use_amp=True):
     correct = 0
     total = 0
     val_start = time.time()
+    vstart_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[validate] epoch {_EPOCH_COUNTER} start: {vstart_ts}")
+    _logger.info(f"validate epoch {_EPOCH_COUNTER} start: {vstart_ts}")
 
     with torch.no_grad():
-        progress_bar = tqdm(dataloader, desc="Validation", leave=False)
+        progress_bar = tqdm(
+            dataloader,
+            desc=f"Validation (epoch {_EPOCH_COUNTER})",
+            leave=False,
+            dynamic_ncols=True,
+            mininterval=0.1,
+            smoothing=0.1,
+            ascii=True,
+        )
 
         for inputs, labels in progress_bar:
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -362,6 +387,9 @@ def validate_epoch(model, dataloader, criterion, device, use_amp=True):
         fieldnames=["epoch", "val_loss", "val_acc", "val_time_sec"],
     )
     _logger.info(f"Epoch {_EPOCH_COUNTER} val: loss={epoch_loss:.4f}, acc={epoch_acc:.2f}%, time={val_time:.1f}s")
+    vend_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[validate] epoch {_EPOCH_COUNTER} end:   {vend_ts}")
+    _logger.info(f"validate epoch {_EPOCH_COUNTER} end: {vend_ts}")
 
     return epoch_loss, epoch_acc
 

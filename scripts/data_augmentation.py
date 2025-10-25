@@ -9,6 +9,7 @@ import albumentations as A
 from PIL import Image
 import os
 import json
+import time
 
 # file logger for augmentation diagnostics
 LOG_DIR = Path(os.environ.get("TRAIN_LOG_DIR", "logs"))
@@ -147,6 +148,9 @@ class ImageAugmenter:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         count = 0
+        start_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[augmentation] start: {start_ts}")
+        logger.info(f"augmentation start: {start_ts}")
 
         # Idempotency: if metadata exists and seems consistent, skip
         meta_path = output_path / ".augment_meta.json"
@@ -164,6 +168,9 @@ class ImageAugmenter:
                 # consider it done if configs match and output is non-empty
                 if meta == expected and any(output_path.rglob("*.*")):
                     logger.info("Augmentation skipped: existing output matches configuration.")
+                    end_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[augmentation] end:   {end_ts}")
+                    logger.info(f"augmentation end: {end_ts}")
                     return
             except Exception as e:
                 logger.warning(f"Failed reading augmentation metadata, will re-run: {e}")
@@ -200,6 +207,9 @@ class ImageAugmenter:
         logger.info(
             f"Augmentation of {count} images completed. Output saved to: {output_dir}"
         )
+        end_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[augmentation] end:   {end_ts}")
+        logger.info(f"augmentation end: {end_ts}")
         # Write metadata for idempotency
         try:
             meta = {

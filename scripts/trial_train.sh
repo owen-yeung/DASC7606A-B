@@ -3,7 +3,7 @@
 
 python main.py \
   --dataset cifar100 \
-  --data_dir data/raw \
+  --data_dir data \
   --output_dir results \
   --device cuda \
   --batch_size 128 \
