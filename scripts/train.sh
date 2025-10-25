@@ -10,4 +10,5 @@ python main.py \
   --num_epochs 150 \
   --lr 0.001 \
   --weight_decay 5e-4 \
+  --early_stopping_patience 20 \
   --num_workers 4
