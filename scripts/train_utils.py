@@ -116,44 +116,41 @@ def load_data(data_dir, batch_size):
     return train_loader, val_loader
 
 
-def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float, 
+def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float):
+    """
+    Backward-compatible optimizer setup expected by main.py.
+    Returns (criterion, optimizer, scheduler).
+    """
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999), eps=1e-8)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+    _logger.info(f"Optimizer: AdamW(lr={lr}, weight_decay={weight_decay})")
+    _logger.info("Scheduler: ReduceLROnPlateau(patience=3, factor=0.5)")
+    if torch.cuda.is_available():
+        _logger.info(f"CUDA available: True, device_name={torch.cuda.get_device_name(0)}")
+    else:
+        _logger.info("CUDA available: False")
+    return criterion, optimizer, scheduler
+
+
+def define_loss_and_optimizer_advanced(model: nn.Module, lr: float, weight_decay: float, 
                             num_epochs: int, steps_per_epoch: int, label_smoothing: float = 0.1):
     """
-    Define the loss function and optimizer
-    This function is similar to the cell 3. Model Configuration in 04_model_training.ipynb
-    Args:
-        model: The model to train
-        lr: Learning rate
-        weight_decay: Weight decay
-        num_epochs: Total number of training epochs
-        steps_per_epoch: Number of steps per epoch
-        label_smoothing: Label smoothing factor (0.0 to 1.0)
-    Returns:
-        criterion: The loss function
-        optimizer: The optimizer
-        scheduler: The scheduler
-        scaler: GradScaler for mixed precision training
+    Advanced optimizer setup with cosine warmup and mixed precision scaler.
+    Returns (criterion, optimizer, scheduler, scaler).
     """
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, 
                            betas=(0.9, 0.999), eps=1e-8)
-    
-    # Cosine annealing scheduler with warmup
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = 5 * steps_per_epoch
-    
     def lr_lambda(current_step):
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265359))))
-    
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    # Mixed precision scaler
     scaler = GradScaler()
-
-    # Log configuration
     _logger.info(f"Optimizer: AdamW(lr={lr}, weight_decay={weight_decay})")
     _logger.info(f"Label smoothing: {label_smoothing}")
     _logger.info(f"Scheduler: Cosine with warmup_steps={warmup_steps}, total_steps={total_steps}")
@@ -161,11 +158,10 @@ def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float,
         _logger.info(f"CUDA available: True, device_name={torch.cuda.get_device_name(0)}")
     else:
         _logger.info("CUDA available: False")
-    
     return criterion, optimizer, scheduler, scaler
 
 
-def train_epoch(model, dataloader, criterion, optimizer, scheduler, scaler, device, 
+def train_epoch_advanced(model, dataloader, criterion, optimizer, scheduler, scaler, device, 
                max_grad_norm=1.0, use_amp=True):
     """
     Train the model for one epoch with mixed precision and gradient clipping
@@ -277,6 +273,21 @@ def train_epoch(model, dataloader, criterion, optimizer, scheduler, scaler, devi
     _logger.info(f"Epoch {_EPOCH_COUNTER} train: loss={epoch_loss:.4f}, acc={epoch_acc:.2f}%, time={epoch_time:.1f}s")
 
     return epoch_loss, epoch_acc
+
+
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Backward-compatible training loop expected by main.py.
+    Creates a no-op scheduler and GradScaler, then delegates to train_epoch_advanced.
+    Returns (epoch_loss, epoch_acc).
+    """
+    # no-op per-step scheduler
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    scaler = GradScaler()
+    return train_epoch_advanced(
+        model, dataloader, criterion, optimizer, scheduler, scaler, device,
+        max_grad_norm=1.0, use_amp=True
+    )
 
 
 def validate_epoch(model, dataloader, criterion, device, use_amp=True):
