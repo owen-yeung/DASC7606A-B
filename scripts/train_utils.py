@@ -6,17 +6,65 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+import time
+import csv
+import logging
+from pathlib import Path
+
+# lightweight diagnostics to disk
+_EPOCH_COUNTER = 0
+_LOG_DIR = Path(os.environ.get("TRAIN_LOG_DIR", "logs"))
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_TRAIN_CSV = _LOG_DIR / "metrics_train.csv"
+_VAL_CSV = _LOG_DIR / "metrics_val.csv"
+_EPOCH_CSV = _LOG_DIR / "metrics_epoch.csv"
+_DATASET_SUMMARY = _LOG_DIR / "dataset_summary.txt"
+
+_logger = logging.getLogger(__name__)
+if not _logger.handlers:
+    _logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(_LOG_DIR / "train.log")
+    fh.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fmt)
+    _logger.addHandler(fh)
+
+def _append_csv(path: Path, row: dict, fieldnames: list):
+    new_file = not path.exists()
+    with path.open('a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if new_file:
+            writer.writeheader()
+        writer.writerow(row)
 
 
-def load_transforms():
+def load_transforms(is_training=True):
     """
-    Load the data transformations
+    Load the data transformations optimized for CIFAR-100
+    
+    Args:
+        is_training: Whether to apply training augmentations
     """
-    return transforms.Compose([
-        transforms.Resize((32, 32)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
+    # CIFAR-100 mean and std
+    cifar100_mean = (0.5071, 0.4867, 0.4408)
+    cifar100_std = (0.2675, 0.2565, 0.2761)
+    
+    if is_training:
+        return transforms.Compose([
+            transforms.Resize((32, 32)),
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(cifar100_mean, cifar100_std),
+            transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize(cifar100_mean, cifar100_std)
+        ])
 
 def load_data(data_dir, batch_size):
     """
@@ -31,17 +79,20 @@ def load_data(data_dir, batch_size):
         val_loader: The validation data loader
     """
     # Define data transformations: resize, convert to tensor, and normalize
-    data_transforms = load_transforms()
+    train_transforms = load_transforms(is_training=True)
+    val_transforms = load_transforms(is_training=False)
 
     # Load the train dataset from the augmented data directory
-    train_dataset = datasets.ImageFolder(root=data_dir, transform=data_transforms)
+    train_dataset = datasets.ImageFolder(root=data_dir, transform=train_transforms)
 
     # Load the validation dataset from the raw data directory
-    val_dataset = datasets.ImageFolder(root=data_dir + "/../../raw/val", transform=data_transforms)
+    val_dataset = datasets.ImageFolder(root=data_dir + "/../../raw/val", transform=val_transforms)
 
     # Create data loaders for training and validation
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                             num_workers=4, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                           num_workers=4, pin_memory=True, persistent_workers=True)
 
     # Print dataset summary
     print(f"Dataset loaded from: {data_dir}")
@@ -50,10 +101,23 @@ def load_data(data_dir, batch_size):
     print(f"Training set size: {len(train_dataset)}")
     print(f"Validation set size: {len(val_dataset)}")
 
+    # Also persist a dataset summary for diagnostics
+    try:
+        with _DATASET_SUMMARY.open('w') as f:
+            f.write(f"data_dir: {data_dir}\n")
+            f.write(f"num_classes: {len(train_dataset.classes)}\n")
+            f.write(f"classes: {train_dataset.classes}\n")
+            f.write(f"train_size: {len(train_dataset)}\n")
+            f.write(f"val_size: {len(val_dataset)}\n")
+            f.write(f"batch_size: {batch_size}\n")
+    except Exception as e:
+        _logger.warning(f"Failed writing dataset summary: {e}")
+
     return train_loader, val_loader
 
 
-def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float):
+def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float, 
+                            num_epochs: int, steps_per_epoch: int, label_smoothing: float = 0.1):
     """
     Define the loss function and optimizer
     This function is similar to the cell 3. Model Configuration in 04_model_training.ipynb
@@ -61,49 +125,105 @@ def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float):
         model: The model to train
         lr: Learning rate
         weight_decay: Weight decay
+        num_epochs: Total number of training epochs
+        steps_per_epoch: Number of steps per epoch
+        label_smoothing: Label smoothing factor (0.0 to 1.0)
     Returns:
         criterion: The loss function
         optimizer: The optimizer
         scheduler: The scheduler
+        scaler: GradScaler for mixed precision training
     """
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-    return criterion, optimizer, scheduler
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, 
+                           betas=(0.9, 0.999), eps=1e-8)
+    
+    # Cosine annealing scheduler with warmup
+    total_steps = num_epochs * steps_per_epoch
+    warmup_steps = 5 * steps_per_epoch
+    
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265359))))
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # Mixed precision scaler
+    scaler = GradScaler()
+
+    # Log configuration
+    _logger.info(f"Optimizer: AdamW(lr={lr}, weight_decay={weight_decay})")
+    _logger.info(f"Label smoothing: {label_smoothing}")
+    _logger.info(f"Scheduler: Cosine with warmup_steps={warmup_steps}, total_steps={total_steps}")
+    if torch.cuda.is_available():
+        _logger.info(f"CUDA available: True, device_name={torch.cuda.get_device_name(0)}")
+    else:
+        _logger.info("CUDA available: False")
+    
+    return criterion, optimizer, scheduler, scaler
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, scheduler, scaler, device, 
+               max_grad_norm=1.0, use_amp=True):
     """
-    Train the model for one epoch
+    Train the model for one epoch with mixed precision and gradient clipping
     Args:
         model: The model to train
         dataloader: DataLoader for training data
         criterion: Loss function
         optimizer: Optimizer
+        scheduler: Learning rate scheduler
+        scaler: GradScaler for mixed precision
         device: Device to train on
+        max_grad_norm: Maximum gradient norm for clipping
+        use_amp: Whether to use automatic mixed precision
     Returns:
         Average loss and accuracy for the epoch
     """
+    global _EPOCH_COUNTER
+    _EPOCH_COUNTER += 1
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
+    start_epoch_time = time.time()
 
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
 
     for inputs, labels in progress_bar:
-        inputs, labels = inputs.to(device), labels.to(device)
+        inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        batch_start = time.time()
 
         # Zero the parameter gradients
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-
-        # Backward pass and optimize
-        loss.backward()
-        optimizer.step()
+        # Mixed precision forward pass
+        if use_amp:
+            with autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            
+            # Optimizer step
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+        
+        # Update scheduler
+        scheduler.step()
 
         # Statistics
         running_loss += loss.item() * inputs.size(0)
@@ -112,24 +232,62 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         correct += predicted.eq(labels).sum().item()
 
         # Update progress bar
+        current_lr = optimizer.param_groups[0]['lr']
         progress_bar.set_postfix(
-            {"Loss": f"{loss.item():.4f}", "Acc": f"{100.0 * correct / total:.2f}%"}
+            {"Loss": f"{loss.item():.4f}", "Acc": f"{100.0 * correct / total:.2f}%", 
+             "LR": f"{current_lr:.6f}"}
         )
+
+        # Write batch diagnostics
+        batch_time = time.time() - batch_start
+        _append_csv(
+            _TRAIN_CSV,
+            {
+                "epoch": _EPOCH_COUNTER,
+                "loss": float(loss.item()),
+                "acc": float(100.0 * correct / max(1, total)),
+                "lr": float(current_lr),
+                "grad_norm": float(getattr(grad_norm, 'item', lambda: grad_norm)()),
+                "batch_time_sec": float(batch_time),
+                "batch_size": int(inputs.size(0)),
+            },
+            fieldnames=["epoch", "loss", "acc", "lr", "grad_norm", "batch_time_sec", "batch_size"],
+        )
+
+        # NaN/Inf checks
+        if not torch.isfinite(loss):
+            _logger.error("Non-finite loss detected. Stopping training.")
+            break
 
     epoch_loss = running_loss / total
     epoch_acc = 100.0 * correct / total
+    epoch_time = time.time() - start_epoch_time
+
+    # Persist epoch metrics
+    _append_csv(
+        _EPOCH_CSV,
+        {
+            "epoch": _EPOCH_COUNTER,
+            "train_loss": float(epoch_loss),
+            "train_acc": float(epoch_acc),
+            "epoch_time_sec": float(epoch_time),
+        },
+        fieldnames=["epoch", "train_loss", "train_acc", "epoch_time_sec"],
+    )
+    _logger.info(f"Epoch {_EPOCH_COUNTER} train: loss={epoch_loss:.4f}, acc={epoch_acc:.2f}%, time={epoch_time:.1f}s")
 
     return epoch_loss, epoch_acc
 
 
-def validate_epoch(model, dataloader, criterion, device):
+def validate_epoch(model, dataloader, criterion, device, use_amp=True):
     """
-    Validate the model
+    Validate the model with mixed precision
     Args:
         model: The model to validate
         dataloader: DataLoader for validation data
         criterion: Loss function
         device: Device to validate on
+        use_amp: Whether to use automatic mixed precision
     Returns:
         Average loss and accuracy for the validation set
     """
@@ -137,16 +295,22 @@ def validate_epoch(model, dataloader, criterion, device):
     running_loss = 0.0
     correct = 0
     total = 0
+    val_start = time.time()
 
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
 
         for inputs, labels in progress_bar:
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
-            # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            # Mixed precision forward pass
+            if use_amp:
+                with autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+            else:
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
 
             # Statistics
             running_loss += loss.item() * inputs.size(0)
@@ -159,8 +323,34 @@ def validate_epoch(model, dataloader, criterion, device):
                 {"Loss": f"{loss.item():.4f}", "Acc": f"{100.0 * correct / total:.2f}%"}
             )
 
+            # Per-batch validation metrics (optional but helpful for debugging)
+            _append_csv(
+                _VAL_CSV,
+                {
+                    "epoch": _EPOCH_COUNTER,
+                    "loss": float(loss.item()),
+                    "acc": float(100.0 * correct / max(1, total)),
+                    "batch_size": int(inputs.size(0)),
+                },
+                fieldnames=["epoch", "loss", "acc", "batch_size"],
+            )
+
     epoch_loss = running_loss / total
     epoch_acc = 100.0 * correct / total
+    val_time = time.time() - val_start
+
+    # Append to epoch csv
+    _append_csv(
+        _EPOCH_CSV,
+        {
+            "epoch": _EPOCH_COUNTER,
+            "val_loss": float(epoch_loss),
+            "val_acc": float(epoch_acc),
+            "val_time_sec": float(val_time),
+        },
+        fieldnames=["epoch", "val_loss", "val_acc", "val_time_sec"],
+    )
+    _logger.info(f"Epoch {_EPOCH_COUNTER} val: loss={epoch_loss:.4f}, acc={epoch_acc:.2f}%, time={val_time:.1f}s")
 
     return epoch_loss, epoch_acc
 

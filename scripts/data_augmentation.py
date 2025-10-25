@@ -7,10 +7,23 @@ import numpy as np
 import torch
 import albumentations as A
 from PIL import Image
+import os
+import json
+
+# file logger for augmentation diagnostics
+LOG_DIR = Path(os.environ.get("TRAIN_LOG_DIR", "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_aug_log_path = LOG_DIR / "augment.log"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+if not any(isinstance(h, logging.FileHandler) and h.baseFilename == str(_aug_log_path) for h in logger.handlers):
+    fh = logging.FileHandler(_aug_log_path)
+    fh.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
 
 
 class ImageAugmenter:
@@ -39,31 +52,58 @@ class ImageAugmenter:
 
         self._set_seed()
 
-        # Define Albumentations pipeline
+        # Define Albumentations pipeline optimized for CIFAR-100 (32x32)
         self.transform = A.Compose(
             [
-                A.Rotate(limit=15, p=0.8),
                 A.HorizontalFlip(p=0.5),
                 A.ShiftScaleRotate(
-                    shift_limit=0.1,
+                    shift_limit=0.0625,
                     scale_limit=0.1,
-                    rotate_limit=0,
-                    p=0.8,
-                    border_mode=0,  # cv2.BORDER_CONSTANT
+                    rotate_limit=15,
+                    p=0.7,
+                    border_mode=0,
                 ),
                 A.ColorJitter(
-                    brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.8
+                    brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.8
                 ),
                 A.OneOf(
                     [
-                        A.GaussianBlur(blur_limit=(3, 7), p=0.5),
-                        A.MotionBlur(blur_limit=7, p=0.5),
+                        A.GaussianBlur(blur_limit=(3, 5), p=0.5),
+                        A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
                     ],
-                    p=0.3,
+                    p=0.2,
                 ),
-                A.RandomBrightnessContrast(p=0.2),
+                A.CoarseDropout(
+                    max_holes=1,
+                    max_height=16,
+                    max_width=16,
+                    min_holes=1,
+                    min_height=8,
+                    min_width=8,
+                    fill_value=0,
+                    p=0.5,
+                ),
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.2, contrast_limit=0.2, p=0.3
+                ),
             ]
         )
+
+        # Persist augmentation configuration for diagnostics
+        try:
+            cfg_txt = LOG_DIR / "augment_config.txt"
+            with cfg_txt.open('w') as f:
+                f.write(f"augmentations_per_image={self.augmentations_per_image}\n")
+                f.write(f"seed={self.seed}\n")
+                f.write(f"save_original={self.save_original}\n")
+                f.write("pipeline=\n")
+                for t in self.transform.transforms:
+                    f.write(f"  - {t}\n")
+        except Exception as e:
+            logger.warning(f"Failed writing augmentation config: {e}")
+
+    def _pipeline_signature(self) -> list:
+        return [str(t) for t in self.transform.transforms]
 
     def _set_seed(self):
         """Set random seeds for reproducibility."""
@@ -108,6 +148,26 @@ class ImageAugmenter:
         output_path.mkdir(parents=True, exist_ok=True)
         count = 0
 
+        # Idempotency: if metadata exists and seems consistent, skip
+        meta_path = output_path / ".augment_meta.json"
+        if meta_path.exists():
+            try:
+                with meta_path.open('r') as f:
+                    meta = json.load(f)
+                expected = {
+                    "input_dir": str(Path(input_dir).resolve()),
+                    "augmentations_per_image": self.augmentations_per_image,
+                    "seed": self.seed,
+                    "save_original": self.save_original,
+                    "pipeline": self._pipeline_signature(),
+                }
+                # consider it done if configs match and output is non-empty
+                if meta == expected and any(output_path.rglob("*.*")):
+                    logger.info("Augmentation skipped: existing output matches configuration.")
+                    return
+            except Exception as e:
+                logger.warning(f"Failed reading augmentation metadata, will re-run: {e}")
+
         image_files = self._find_image_files(input_path)
 
         logger.info(f"Found {len(image_files)} images to augment.")
@@ -140,6 +200,29 @@ class ImageAugmenter:
         logger.info(
             f"Augmentation of {count} images completed. Output saved to: {output_dir}"
         )
+        # Write metadata for idempotency
+        try:
+            meta = {
+                "input_dir": str(Path(input_dir).resolve()),
+                "augmentations_per_image": self.augmentations_per_image,
+                "seed": self.seed,
+                "save_original": self.save_original,
+                "pipeline": self._pipeline_signature(),
+            }
+            with (output_path / ".augment_meta.json").open('w') as f:
+                json.dump(meta, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed writing augmentation metadata: {e}")
+        # Write a summary file
+        try:
+            summary_path = LOG_DIR / "augment_summary.txt"
+            with summary_path.open('w') as f:
+                f.write(f"input_dir: {input_dir}\n")
+                f.write(f"output_dir: {output_dir}\n")
+                f.write(f"images_found: {len(image_files)}\n")
+                f.write(f"augmented_images_written: {count}\n")
+        except Exception as e:
+            logger.warning(f"Failed writing augmentation summary: {e}")
 
     def _find_image_files(self, root: Path) -> List[Path]:
         """
