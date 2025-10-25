@@ -3,11 +3,11 @@
 
 python main.py \
   --dataset cifar100 \
-  --data_dir data \
+  --data_dir data/raw \
   --output_dir results \
   --device cuda \
-  --batch_size 256 \
+  --batch_size 512 \
   --num_epochs 3 \
-  --lr 0.2 \
-  --weight_decay 5e-4 \
+  --lr 0.4 \
+  --weight_decay 1e-4 \
   --num_workers 4
