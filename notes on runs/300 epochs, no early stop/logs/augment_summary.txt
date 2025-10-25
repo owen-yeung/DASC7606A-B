@@ -1,0 +1,4 @@
+input_dir: data/raw/train/
+output_dir: data/augmented/train/
+images_found: 40000
+augmented_images_written: 120000

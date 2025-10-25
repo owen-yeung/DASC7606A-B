@@ -7,8 +7,8 @@ python main.py \
   --output_dir results \
   --device cuda \
   --batch_size 128 \
-  --num_epochs 150 \
+  --num_epochs 300 \
   --lr 0.001 \
   --weight_decay 5e-4 \
-  --early_stopping_patience 20 \
+  --early_stopping_patience 300 \
   --num_workers 4
