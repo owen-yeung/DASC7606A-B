@@ -57,7 +57,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="CIFAR-10/100 Training Pipeline")
 
     # Dataset selection
-    parser.add_argument("--dataset", type=str, choices=["cifar10", "cifar100"], default="cifar10",
+    parser.add_argument("--dataset", type=str, choices=["cifar10", "cifar100"], default="cifar100",
                         help="Dataset to use (cifar10 or cifar100)")
 
     # Data paths
